@@ -7,12 +7,13 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY package*.json ./
-
+COPY package.json ./
 RUN npm install --omit=dev
 
-COPY server.js ./
+COPY ./server.js /app/server.js
 
 ENV NODE_ENV=production
+
+EXPOSE 3000
 
 CMD ["npm", "start"]
