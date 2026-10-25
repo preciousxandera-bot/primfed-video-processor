@@ -10,14 +10,14 @@ const { promisify } = require("util");
 const app = express();
 const runFile = promisify(execFile);
 
-app.use(express.json({ limit: "1mb" }));
-
 const PORT = process.env.PORT || 3000;
-const MAX_BYTES = 10 * 1024 * 1024;
+const MAX_SIZE = 10 * 1024 * 1024;
 const MAX_DURATION = 60;
-const OUTPUT_DIR = path.join(os.tmpdir(), "primfed-videos");
+const VIDEO_DIR = path.join(os.tmpdir(), "primfed-videos");
 
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+fs.mkdirSync(VIDEO_DIR, { recursive: true });
+
+app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (req, res) => {
   res.json({ status: "Primfed video processor is running" });
@@ -27,12 +27,18 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
-function checkApiKey(req, res, next) {
+function authenticate(req, res, next) {
   const key = process.env.PRIMFED_API_KEY;
 
-  if (!key || req.get("x-api-key") !== key) {
+  if (!key) {
+    return res.status(503).json({
+      error: "Server API key is not configured"
+    });
+  }
+
+  if (req.get("x-api-key") !== key) {
     return res.status(401).json({
-      error: "Invalid or missing API key"
+      error: "Invalid API key"
     });
   }
 
@@ -43,54 +49,54 @@ async function downloadVideo(url, destination) {
   const parsed = new URL(url);
 
   if (parsed.protocol !== "https:") {
-    throw new Error("A secure HTTPS video URL is required");
+    throw new Error("Video URL must use HTTPS");
   }
 
   const response = await fetch(url, {
-    signal: AbortSignal.timeout(60000),
-    redirect: "error"
+    redirect: "error",
+    signal: AbortSignal.timeout(60000)
   });
 
-  if (!response.ok || !response.body) {
+  if (!response.ok) {
     throw new Error("Could not download the source video");
   }
 
-  const declaredSize = Number(response.headers.get("content-length") || 0);
+  if (!response.body) {
+    throw new Error("The source video is empty");
+  }
 
-  if (declaredSize > MAX_BYTES) {
+  const declaredSize = Number(
+    response.headers.get("content-length") || 0
+  );
+
+  if (declaredSize > MAX_SIZE) {
     throw new Error("Video exceeds the 10 MB limit");
   }
 
-  const file = fs.createWriteStream(destination);
+  const chunks = [];
   let total = 0;
 
-  try {
-    for await (const chunk of response.body) {
-      total += chunk.length;
+  for await (const chunk of response.body) {
+    total += chunk.length;
 
-      if (total > MAX_BYTES) {
-        throw new Error("Video exceeds the 10 MB limit");
-      }
-
-      if (!file.write(chunk)) {
-        await new Promise((resolve, reject) => {
-          file.once("drain", resolve);
-          file.once("error", reject);
-        });
-      }
+    if (total > MAX_SIZE) {
+      throw new Error("Video exceeds the 10 MB limit");
     }
 
-    await new Promise((resolve, reject) => {
-      file.end(resolve);
-      file.once("error", reject);
-    });
-  } catch (error) {
-    file.destroy();
-    throw error;
+    chunks.push(chunk);
   }
+
+  if (total === 0) {
+    throw new Error("The source video is empty");
+  }
+
+  await fs.promises.writeFile(
+    destination,
+    Buffer.concat(chunks)
+  );
 }
 
-app.post("/process", checkApiKey, async (req, res) => {
+app.post("/process", authenticate, async (req, res) => {
   const sourceUrl = req.body?.source_video_url;
 
   if (typeof sourceUrl !== "string") {
@@ -111,40 +117,40 @@ app.post("/process", checkApiKey, async (req, res) => {
 
   if (parsed.protocol !== "https:") {
     return res.status(400).json({
-      error: "HTTPS video URLs only"
+      error: "HTTPS URLs are required"
     });
   }
 
   const id = crypto.randomUUID();
-  const workDir = path.join(OUTPUT_DIR, id);
-  const inputFile = path.join(workDir, "source.mp4");
-  const playlist = path.join(workDir, "index.m3u8");
+  const folder = path.join(VIDEO_DIR, id);
+  const input = path.join(folder, "source.mp4");
+  const playlist = path.join(folder, "index.m3u8");
 
   try {
-    fs.mkdirSync(workDir, { recursive: true });
+    await fs.promises.mkdir(folder, { recursive: true });
 
-    await downloadVideo(sourceUrl, inputFile);
+    await downloadVideo(sourceUrl, input);
 
-    const { stdout } = await runFile("ffprobe", [
+    const probe = await runFile("ffprobe", [
       "-v", "error",
       "-show_entries", "format=duration",
       "-of", "default=noprint_wrappers=1:nokey=1",
-      inputFile
-    ], { timeout: 15000 });
+      input
+    ], { timeout: 20000 });
 
-    const duration = Number(stdout.trim());
+    const duration = Number(probe.stdout.trim());
 
     if (!Number.isFinite(duration) || duration <= 0) {
-      throw new Error("Could not read video duration");
+      throw new Error("Could not determine video duration");
     }
 
     if (duration > MAX_DURATION) {
-      throw new Error("Video exceeds the 60-second limit");
+      throw new Error("Video exceeds 60 seconds");
     }
 
     await runFile("ffmpeg", [
       "-y",
-      "-i", inputFile,
+      "-i", input,
       "-map", "0:v:0",
       "-map", "0:a:0?",
       "-c:v", "libx264",
@@ -156,45 +162,62 @@ app.post("/process", checkApiKey, async (req, res) => {
       "-hls_time", "1",
       "-hls_playlist_type", "vod",
       "-hls_segment_filename",
-      path.join(workDir, "segment_%03d.ts"),
+      path.join(folder, "segment_%03d.ts"),
       playlist
-    ], { timeout: 120000, maxBuffer: 1024 * 1024 });
+    ], {
+      timeout: 120000,
+      maxBuffer: 2 * 1024 * 1024
+    });
 
-    fs.unlinkSync(inputFile);
+    await fs.promises.unlink(input);
 
-    res.json({
+    return res.json({
       status: "processed",
       job_id: id,
       duration_seconds: duration,
       manifest_url: `/videos/${id}/index.m3u8`
     });
   } catch (error) {
-    fs.rmSync(workDir, { recursive: true, force: true });
+    await fs.promises.rm(folder, {
+      recursive: true,
+      force: true
+    });
 
-    res.status(400).json({
+    console.error("Primfed processing error:", error);
+
+    return res.status(400).json({
       error: error.message || "Video processing failed"
     });
   }
 });
 
-app.get("/videos/:id/:file", (req, res) => {
+app.get("/videos/:id/:file", async (req, res) => {
   const { id, file } = req.params;
 
-  if (!/^[a-f0-9-]{36}$/i.test(id) ||
-      !/^(index\.m3u8|segment_\d+\.ts)$/.test(file)) {
+  if (
+    !/^[a-f0-9-]{36}$/i.test(id) ||
+    !/^(index\.m3u8|segment_\d+\.ts)$/.test(file)
+  ) {
     return res.sendStatus(404);
   }
 
-  const filePath = path.join(OUTPUT_DIR, id, file);
+  const filename = path.join(VIDEO_DIR, id, file);
 
-  if (!fs.existsSync(filePath)) {
+  try {
+    await fs.promises.access(filename);
+  } catch {
     return res.sendStatus(404);
   }
 
-  res.type(file.endsWith(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp2t");
-  res.sendFile(filePath);
+  res.type(
+    file.endsWith(".m3u8")
+      ? "application/vnd.apple.mpegurl"
+      : "video/mp2t"
+  );
+
+  res.sendFile(filename);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Primfed server running on port ${PORT}`);
+  console.log(`Primfed server listening on port ${PORT}`);
 });
